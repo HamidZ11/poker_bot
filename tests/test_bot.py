@@ -25,6 +25,7 @@ from engine import play_hand
 from game_state import GameState, GameStateView, InvalidAction
 from model import Model, hand_key
 from player_action import PlayerAction as A
+from preflop_ranges import RANGE_EQUITY, RANGE_STEPS
 from preflop_table import EQUITY, PERCENTILE
 
 
@@ -85,6 +86,17 @@ def test_the_table_ranks_all_169_hands():
     assert EQUITY["AA"] == pytest.approx(0.852, abs=0.01)
     assert EQUITY["72o"] == pytest.approx(0.346, abs=0.01)
     assert PERCENTILE["AKs"] < PERCENTILE["T9s"] < PERCENTILE["72o"]
+
+
+def test_the_range_table_covers_every_hand_and_width():
+    assert set(RANGE_EQUITY) == set(EQUITY)
+    assert all(len(row) == RANGE_STEPS for row in RANGE_EQUITY.values())
+    for hand, row in RANGE_EQUITY.items():
+        # The widest range is every hand: the same as against a random one.
+        assert row[-1] == pytest.approx(EQUITY[hand], abs=0.025)
+    # Strong hands lose equity as the range tightens.
+    assert RANGE_EQUITY["K9o"][1] < RANGE_EQUITY["K9o"][-1] - 0.1
+    assert RANGE_EQUITY["AA"][0] > 0.8
 
 
 def test_hand_key_orders_ranks_and_reads_suits():
@@ -515,7 +527,7 @@ def test_the_code_review_flags_nothing(tmp_path):
     path = tmp_path / "myteam.pkl"
     path.write_bytes(pickle.dumps(Model()))
     sources = []
-    for name in ("model.py", "preflop_table.py"):
+    for name in ("model.py", "preflop_table.py", "preflop_ranges.py"):
         sources.append(shutil.copy(name, tmp_path / name))
     report = vet.vet(path, sources)
     assert report.ok, report.lines()

@@ -13,15 +13,13 @@ import time
 from card_utils import Card, evaluate, full_deck
 from game_state import GameStateView
 from player_action import DEALER, PlayerAction
+from preflop_ranges import RANGE_EQUITY, RANGE_STEPS
 from preflop_table import PERCENTILE
 
 SIM_CAP = 0.12  # seconds for one equity estimate, range building included
 CHECK_EVERY = 50  # trials or hands between looks at the clock
 SIM_TRIALS = 800
 
-VALUE_BET = 0.60  # equity to bet when checked to
-VALUE_RAISE = 0.75  # equity to raise a bet
-CALL_MARGIN = 0.04  # equity above the pot odds to call a bet postflop
 ALL_IN_MARGIN = 0.01  # the same preflop, where nothing is left to lose later
 PREFLOP_SHOVE = 0.65  # equity to shove over a big preflop raise
 ALL_IN_SHARE = 0.85  # a raise this close to the whole stack becomes all-in
@@ -79,6 +77,11 @@ class Model:
     team: the one thing kept from hand to hand.
     """
 
+    VALUE_BET = 0.60  # equity to bet when checked to
+    VALUE_RAISE = 0.75  # equity to raise a bet
+    CALL_MARGIN = 0.04  # equity above the pot odds to call a bet postflop
+    CHART_SCALE = 1.0  # above 1 plays more hands preflop, below 1 fewer
+
     def __init__(self):
         self.hand = []
         self.player_id = None
@@ -87,7 +90,7 @@ class Model:
         self.log = []  # every action this hand, oldest first
         self.seat_chips = ()  # each seat's chips when the hand began
         self.big_raises = {}
-        self.preflop_equity = {}  # (hand, range width): equity, a cache
+        self.sim_trials = SIM_TRIALS
         self.rng = random.Random(20261107)
         self.errors = 0
         self.strict = False
@@ -223,7 +226,7 @@ class Model:
         biggest = max(gs.stacks[p] + gs.bets[p] for p in others)
         depth = min(gs.stacks[me] + gs.bets[me], biggest) / gs.big_blind
         # The charts are heads-up: each extra player counts the hand weaker.
-        hand = self.percentile / 0.6 ** (len(others) - 1)
+        hand = self.percentile / 0.6 ** (len(others) - 1) / self.CHART_SCALE
         raises = sum(a.kind == "raise" for a in self.log)
         if raises == 0:
             if gs.call_amount == 0:
@@ -333,20 +336,22 @@ class Model:
         equity = self._equity(gs)
         if gs.call_amount == 0:
             return self._checked_to(gs, equity)
-        if equity >= VALUE_RAISE and gs.can_raise:
+        if equity >= self.VALUE_RAISE and gs.can_raise:
             if gs.spr(self.player_id) <= 1:
                 return self._shove(gs)
             return self._pot_raise(gs, 0.75)
-        if equity > gs.pot_odds + CALL_MARGIN:
+        if equity > gs.pot_odds + self.CALL_MARGIN:
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(gs)
 
     def _checked_to(self, gs: GameStateView, equity: float) -> PlayerAction:
-        if equity < VALUE_BET:
+        if equity < self.VALUE_BET:
             return PlayerAction.call(self.player_id)
         if gs.spr(self.player_id) <= 1:
             return self._shove(gs)
-        return self._pot_raise(gs, 0.75 if equity >= VALUE_RAISE else 0.5)
+        return self._pot_raise(
+            gs, 0.75 if equity >= self.VALUE_RAISE else 0.5
+        )
 
     # -- what the opponent holds ---------------------------------------------
 
@@ -413,17 +418,15 @@ class Model:
         board: list[Card],
         deadline: float,
         limit: float,
-    ) -> list[tuple[float, Card, Card, tuple | None]]:
-        """The opponent's possible hands as (weight, first, second, rank):
-        rank is theirs on this board, None before the flop."""
+    ) -> list[tuple[float, Card, Card, tuple]]:
+        """The opponent's possible hands as (weight, first, second, rank),
+        rank being theirs on this board."""
         dead = set(self.hand) | set(board)
         hands = [
             (1.0 if strength <= limit else OUTSIDE_RANGE, first, second)
             for first, second, strength in COMBOS
             if first not in dead and second not in dead
         ]
-        if not board:
-            return [(w, first, second, None) for w, first, second in hands]
         self.rng.shuffle(hands)  # so running out of time cuts at random
         ranked = []
         for i, (weight, first, second) in enumerate(hands):
@@ -470,7 +473,8 @@ class Model:
         if limit is None:
             limit = self._range_limit(gs)
         if not board:
-            equity = self._preflop_sim(gs, limit, start)
+            step = max(1, round(limit * RANGE_STEPS))
+            equity = RANGE_EQUITY[self.hand_name][step - 1]
         elif len(board) == 5:  # ranking every hand is the whole job
             hands = self._weighted_hands(gs, board, start + SIM_CAP, limit)
             equity = self._river_equity(hands, board)
@@ -479,18 +483,6 @@ class Model:
             equity = self._simulate(hands, board, start + SIM_CAP)
         opponents = len(gs.players_in_hand) - 1
         return equity ** opponents
-
-    def _preflop_sim(self, gs: GameStateView, limit: float, start: float):
-        """Preflop equity depends only on the hand and the range, so each
-        pair is simulated once, with the range rounded to a 5% step."""
-        limit = round(limit * 20) / 20
-        key = (self.hand_name, limit)
-        if key not in self.preflop_equity:
-            hands = self._weighted_hands(gs, [], start + SIM_CAP, limit)
-            self.preflop_equity[key] = self._simulate(
-                hands, [], start + SIM_CAP
-            )
-        return self.preflop_equity[key]
 
     def _river_equity(self, hands, board: list[Card]) -> float:
         """Exact: every hand they could hold is already ranked."""
@@ -503,12 +495,12 @@ class Model:
 
     def _simulate(self, hands, board: list[Card], deadline: float) -> float:
         """Deals out the board against hands drawn by weight, until
-        SIM_TRIALS or the deadline, whichever comes first."""
+        sim_trials or the deadline, whichever comes first."""
         known = set(self.hand) | set(board)
         unseen = [card for card in DECK if card not in known]
         missing = 5 - len(board)
         picks = self.rng.choices(
-            hands, weights=[hand[0] for hand in hands], k=SIM_TRIALS
+            hands, weights=[hand[0] for hand in hands], k=self.sim_trials
         )
         won = 0.0
         played = 0
