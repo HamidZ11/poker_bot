@@ -80,6 +80,14 @@ STATION_FOLD_RATE = 0.30
 STATION_VALUE_DROP = 0.06  # off the equity needed to bet
 STATION_EXTRA_SIZE = 0.25  # of the pot
 
+# A raise is as wide as this team raises often, starting from RAISED_RANGE.
+# The seats are fixed for a rotation, so that is the raise we are facing:
+# opens from a button, three-bets from a big blind.
+NARROWEST_RAISE = 0.08
+TIGHT_RAISER = 0.50  # below this width we defend fewer hands against it
+TIGHT_DEFENCE = 0.80  # the share of their width we defend with
+LEAST_DEFENCE = 0.15
+
 
 def hand_key(first: Card, second: Card) -> str:
     """A starting hand's name in preflop_table: "AA", "AKs" or "AKo"."""
@@ -324,6 +332,14 @@ class Model:
             "aggressive": 0, "passive": 0,
         })
 
+    def _raise_width(self, team: str, raises: int) -> float:
+        """The share of hands this team raises with, starting from the
+        fixed range for that many raises."""
+        stats = self._stats_of(team)
+        prior = RAISED_RANGE[raises] * PRIOR_WEIGHT
+        width = (stats["pfr"] + prior) / (stats["hands"] + PRIOR_WEIGHT)
+        return min(1.0, max(NARROWEST_RAISE, width))
+
     def _fold_rate(self, team: str, side: str = "post") -> float:
         """The share of our raises this team folds to, on that side of the
         flop, starting from the prior."""
@@ -506,6 +522,11 @@ class Model:
         # raise is defended wider, a dearer one tighter.
         price = (0.30 / max(gs.pot_odds, 0.05)) ** 1.5
         call_share = min(0.85, max(0.05, price * 0.57))
+        width = self._preflop_range(gs)
+        if width < TIGHT_RAISER:
+            call_share = min(
+                call_share, max(LEAST_DEFENCE, TIGHT_DEFENCE * width)
+            )
         if depth <= 18:
             if hand <= 0.15:
                 return self._shove(gs)
@@ -530,7 +551,7 @@ class Model:
                 return self._raise_to(gs, 2.3 * gs.current_bet)
         elif hand <= 0.10:
             return self._shove(gs)
-        equity = self._equity(gs, RAISED_RANGE[2])
+        equity = self._equity(gs)
         if equity > gs.pot_odds + THREE_BET_MARGIN:
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(gs)
@@ -622,7 +643,7 @@ class Model:
 
     # -- what the opponent holds ---------------------------------------------
 
-    def _preflop_range(self) -> float:
+    def _preflop_range(self, gs: GameStateView) -> float:
         """The share of hands the opponent still has, from preflop betting:
         how many raises there were and who made the last one."""
         raises = 0
@@ -635,6 +656,8 @@ class Model:
                 last_raiser = action.player_id
         if last_raiser == self.player_id or raises == 0:
             return CALLED_RANGE.get(raises, TIGHTEST_RANGE)
+        if raises <= 2:
+            return self._raise_width(gs.teams[last_raiser], raises)
         return RAISED_RANGE.get(raises, TIGHTEST_RANGE)
 
     def _board_pressure(self, gs: GameStateView) -> tuple[float, float, float]:
@@ -733,7 +756,7 @@ class Model:
                     ):
                         return self._big_raise_width(gs.teams[seat])
                     break
-        return self._preflop_range()
+        return self._preflop_range(gs)
 
     def _equity(self, gs: GameStateView, limit: float | None = None) -> float:
         """Our share of the pot against the opponent's weighted hands, whose

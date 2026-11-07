@@ -391,12 +391,38 @@ def test_end_game_counts_postflop_turns_only():
 
 def test_preflop_action_narrows_the_range():
     model = bot_with("AS AH", 0)
+    view = GameStateView(table())
     model.log = log_of(A.raise_to(0, 50), A.raise_to(1, 150), A.call(0))
-    assert model._preflop_range() == bot.RAISED_RANGE[2]
+    assert model._preflop_range(view) == bot.RAISED_RANGE[2]
     model.log = log_of(A.raise_to(0, 50), A.call(1), "KC 7D 2H")
-    assert model._preflop_range() == bot.CALLED_RANGE[1]
+    assert model._preflop_range(view) == bot.CALLED_RANGE[1]
     model.log = log_of(*LIMPED)
-    assert model._preflop_range() == 1.0
+    assert model._preflop_range(view) == 1.0
+
+
+def _raiser(hands, raises):
+    model = bot_with("KD 9C", 1)
+    stats = model._stats_of("seat 0")
+    stats["hands"], stats["pfr"] = hands, raises
+    return model
+
+
+def test_a_raise_is_as_wide_as_they_raise_often():
+    view = GameStateView(table())
+    open_raise = log_of(A.raise_to(0, 50))
+    tight, loose = _raiser(200, 10), _raiser(200, 190)
+    tight.log = loose.log = open_raise
+    assert tight._preflop_range(view) < 0.2
+    assert loose._preflop_range(view) > 0.9
+
+
+def test_a_tight_raiser_is_defended_against_with_fewer_hands():
+    moves = (A.raise_to(0, 50),)
+    state = table(*moves)
+    assert _raiser(0, 0).run(log_of(*moves),
+                             GameStateView(state)) == A.call(1)
+    assert _raiser(300, 15).run(log_of(*moves),
+                                GameStateView(state)) == A.fold(1)
 
 
 def test_several_opponents_lower_the_equity():
