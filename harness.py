@@ -8,6 +8,10 @@ heads-up, 25 big blinds, 200 deals per seat rotation, every deal mirrored
     .venv/bin/python harness.py --matches 25 --opponents shove maniac
     .venv/bin/python harness.py --model bot_stage1:Model
     .venv/bin/python harness.py --opponents maniac --diagnose
+    .venv/bin/python harness.py --baseline bot_stage1:Model
+
+--baseline also plays that model on the same decks and reports the change,
+deck by deck: far tighter than comparing two intervals by eye.
 
 A match is 200 deals from both seats: 400 hands. --matches plays that many
 with new decks and pools them, as one match is far too noisy to read. Your
@@ -30,7 +34,8 @@ from arena.dummies import _Bot
 from arena.match import MatchConfig, _deck, play_match
 from arena.players import Player, player
 from card_utils import evaluate
-from evals.score import score
+from evals.score import _deal_values, score
+from evals.stats import ci95, mean_and_se
 from player_action import PlayerAction
 
 DEALS = 200  # per seat rotation
@@ -262,11 +267,25 @@ def play_one(pkl: str, opponent: str, seed: int):
     return play_match(players, config, record), diagnosis
 
 
+def paired_change(ours: list, theirs: list) -> tuple[float, float]:
+    """Our bb/100 minus the baseline's and its 95% interval, from the
+    difference on each deck: the logs must be from the same seeds."""
+    changes = []
+    for mine, base in zip(ours, theirs):
+        changes += [
+            100 * (a - b) for a, b in zip(_deal_values(mine)["you"],
+                                          _deal_values(base)["you"])
+        ]
+    mean, error = mean_and_se(changes)
+    return mean, ci95(error, len(changes))
+
+
 def build_pickle(spec: str, folder: str, trials: int | None) -> str:
     module, _, name = spec.partition(":")
     model = getattr(importlib.import_module(module), name or "Model")()
     if trials is not None:
         model.sim_trials = trials
+    os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "you.pkl")
     with open(path, "wb") as file:
         pickle.dump(model, file)
@@ -282,12 +301,19 @@ def main():
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--trials", type=int, help="sim trials, to run faster")
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() - 1))
+    parser.add_argument("--baseline", metavar="MODEL",
+                        help="also play this model and report the change")
     parser.add_argument("--diagnose", action="store_true",
                         help="show net by seat and folds of the best hand")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as folder:
         pkl = build_pickle(args.model, folder, args.trials)
+        base_pkl = None
+        if args.baseline:
+            base_pkl = build_pickle(args.baseline,
+                                    os.path.join(folder, "baseline"),
+                                    args.trials)
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as executor:
             futures = {
                 name: [
@@ -296,11 +322,19 @@ def main():
                 ]
                 for name in args.opponents
             }
+            base_futures = {
+                name: [
+                    executor.submit(play_one, base_pkl, name, args.seed + m)
+                    for m in range(args.matches)
+                ]
+                for name in args.opponents if base_pkl
+            }
             print(f"{args.model}: {args.matches} matches of {DEALS} deals "
                   f"from both seats, {STACK // 20} bb")
             print(f"{'opponent':<16}{'bb/100':>18}{'verdict':>9}{'hands':>7}"
                   f"{'faults':>7}{'slowest':>9}")
             means, squares = [], 0.0
+            changes, change_squares = [], 0.0
             for name in args.opponents:
                 played = [f.result() for f in futures[name]]
                 result = score([log for log, _ in played])
@@ -317,11 +351,23 @@ def main():
                     for _, part in played:
                         merge(total, part)
                     print_diagnosis(total)
+                if base_pkl:
+                    base = [f.result()[0] for f in base_futures[name]]
+                    change, error = paired_change([log for log, _ in played],
+                                                  base)
+                    changes.append(change)
+                    change_squares += error * error
+                    print(f"    change vs {args.baseline}: {change:+.1f} ± "
+                          f"{error:.1f}", flush=True)
                 means.append(bb)
                 squares += ci * ci
             count = len(means)
             print(f"{'pool average':<16}{sum(means) / count:>+10.1f} ± "
                   f"{math.sqrt(squares) / count:<5.1f}")
+            if changes:
+                print(f"pool change vs {args.baseline}: "
+                      f"{sum(changes) / count:+.1f} ± "
+                      f"{math.sqrt(change_squares) / count:.1f}")
 
 
 if __name__ == "__main__":

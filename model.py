@@ -1,7 +1,8 @@
 """
 The bot: preflop charts by depth, then equity against an estimated range for
 pot-odds calls and value bets. It does not bluff. The only thing it learns
-between hands is how often each opponent shoves or raises big.
+between hands is how often each opponent raises big preflop and how good
+their raising hands turn out to be.
 
 The charts and thresholds are starting values, tuned against heads-up play at
 25 big blinds. With more players the same charts are tightened.
@@ -41,6 +42,12 @@ BIG_RAISE_PRIOR = 0.40
 BIG_RAISE_WEIGHT = 5
 SHOVE_HAPPY = 0.50  # from this rate on, raising small only gets shoved on
 
+# How often says little about how good: a maniac shoves 15% of hands, not the
+# best 15%. Hands shown after a raise correct the width. A range that is even
+# over the top X% averages X / 2, so twice the average shown is the width.
+SHOWN_WEIGHT = 3  # the rate's weight against shown hands
+SMALL_RAISE_SHOWN = 0.25  # a hand shown after a raise that was not big
+
 
 def hand_key(first: Card, second: Card) -> str:
     """A starting hand's name in preflop_table: "AA", "AKs" or "AKo"."""
@@ -74,8 +81,9 @@ class Model:
     Attributes are plain data, as the model is pickled. errors counts the
     exceptions caught; with strict set they are raised again, so a test
     sees a bug that would otherwise look like a quiet check or fold.
-    big_raises holds [hands they acted in, hands they raised big in] per
-    team: the one thing kept from hand to hand.
+    Kept from hand to hand, per team: big_raises, [hands they acted in,
+    hands they raised big in], and shown, [weight, weighted percentile] of
+    the hands they showed after a preflop raise.
     """
 
     VALUE_BET = 0.60  # equity to bet when checked to
@@ -91,6 +99,7 @@ class Model:
         self.log = []  # every action this hand, oldest first
         self.seat_chips = ()  # each seat's chips when the hand began
         self.big_raises = {}
+        self.shown = {}
         self.sim_trials = SIM_TRIALS
         self.rng = random.Random(20261107)
         self.errors = 0
@@ -137,6 +146,7 @@ class Model:
         try:
             self.log.extend(actions)
             self._count_big_raises(game_state)
+            self._count_shown_hands(game_state)
         except Exception:
             self.errors += 1
             if self.strict:
@@ -177,6 +187,34 @@ class Model:
                 counts = self.big_raises.setdefault(gs.teams[seat], [0, 0])
                 counts[0] += 1
                 counts[1] += seat in big
+
+    def _count_shown_hands(self, gs: GameStateView):
+        raised = {}  # seat: how much a hand it shows says about big raises
+        holes = {}
+        preflop = True
+        for action in self.log:
+            seat = action.player_id
+            if seat == DEALER:
+                preflop = False
+            elif action.kind == "raise" and preflop:
+                weight = 1.0 if self._is_big(action) else SMALL_RAISE_SHOWN
+                raised[seat] = max(raised.get(seat, 0.0), weight)
+            elif action.kind == "reveal_card":
+                holes.setdefault(seat, []).append(action.card)
+        for seat, weight in raised.items():
+            if seat != self.player_id and len(holes.get(seat, ())) == 2:
+                percentile = PERCENTILE[hand_key(*holes[seat])]
+                counts = self.shown.setdefault(gs.teams[seat], [0.0, 0.0])
+                counts[0] += weight
+                counts[1] += weight * percentile
+
+    def _big_raise_width(self, team: str) -> float:
+        """The share of hands a big raise from this team comes from: as
+        wide as they do it often, corrected by what they have shown."""
+        weight, total = self.shown.get(team, (0.0, 0.0))
+        rate = self._big_raise_rate(team)
+        width = (rate * SHOWN_WEIGHT + 2 * total) / (SHOWN_WEIGHT + weight)
+        return min(1.0, max(TIGHTEST_RANGE, width))
 
     def _big_raise_rate(self, team: str) -> float:
         """The share of hands this team raises big with, so far."""
@@ -246,9 +284,9 @@ class Model:
         big_blind = gs.big_blind
         others = [p for p in gs.players_in_hand if p != self.player_id]
         if len(others) == 1:
-            rate = self._big_raise_rate(gs.teams[others[0]])
-            if rate >= SHOVE_HAPPY:
-                return self._against_a_shover(gs, rate)
+            team = gs.teams[others[0]]
+            if self._big_raise_rate(team) >= SHOVE_HAPPY:
+                return self._against_a_shover(gs, self._big_raise_width(team))
         if depth <= 10:
             share = 0.85 if depth <= 5 else 0.68 if depth <= 8 else 0.58
             return self._shove(gs) if hand <= share else self._check_or_fold(gs)
@@ -264,12 +302,12 @@ class Model:
             return self._raise_to(gs, 2.5 * big_blind)
         return self._check_or_fold(gs)
 
-    def _against_a_shover(self, gs, rate: float) -> PlayerAction:
+    def _against_a_shover(self, gs, width: float) -> PlayerAction:
         """Any raise of ours gets shoved on, so a hand that would fold to
         that folds now, for less, and one that would call may as well shove."""
         chips = gs.stacks[self.player_id] + gs.bets[self.player_id]
         price = gs.stacks[self.player_id] / (2 * chips)
-        if self._equity(gs, rate) > price + ALL_IN_MARGIN:
+        if self._equity(gs, width) > price + ALL_IN_MARGIN:
             return self._shove(gs)
         return self._check_or_fold(gs)
 
@@ -459,8 +497,7 @@ class Model:
                     if seat != self.player_id and (
                         self._is_big(action) or gs.status(seat) == "all_in"
                     ):
-                        rate = self._big_raise_rate(gs.teams[seat])
-                        return max(TIGHTEST_RANGE, rate)
+                        return self._big_raise_width(gs.teams[seat])
                     break
         return self._preflop_range()
 

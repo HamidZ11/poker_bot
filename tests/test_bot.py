@@ -139,7 +139,7 @@ def _seen_shoving(model: Model, team: str, shoves: int, hands: int):
 def test_the_first_shove_gets_a_wide_prior_not_a_tight_range():
     assert 0.3 <= Model()._big_raise_rate("seat 0") <= 0.5
     limit = _shove_limit(Model())
-    assert limit == Model()._big_raise_rate("seat 0")
+    assert limit == pytest.approx(Model()._big_raise_rate("seat 0"))
 
 
 def _shove_limit(model: Model) -> float:
@@ -155,6 +155,46 @@ def test_the_range_follows_how_often_they_shove():
     _seen_shoving(never, "seat 0", 0, 200)
     assert _shove_limit(always) > 0.9
     assert _shove_limit(never) == bot.TIGHTEST_RANGE
+
+
+def test_shown_hands_correct_a_rate_that_says_nothing_about_strength():
+    random_cards, premiums = Model(), Model()
+    for model, average in ((random_cards, 0.5), (premiums, 0.02)):
+        _seen_shoving(model, "seat 0", 15, 100)
+        model.shown["seat 0"] = [12.0, 12 * average]
+    assert _shove_limit(random_cards) > 0.8
+    assert _shove_limit(premiums) < 0.08
+
+
+def test_end_game_records_a_raiser_s_shown_hand():
+    state = GameState([500, 500], teams=["us", "them"])
+    model = bot_with("AS AH", 0)
+    model.seat_chips = (500, 500)
+    moves = [A.raise_to(0, 500), A.raise_to(1, 500) if False else A.call(1)]
+    for move in moves:
+        state.process_action(move)
+    board = cards("2C 3D 4H 9S JC")
+    deal = [A.reveal_card(card) for card in board]
+    for action in deal:
+        state.process_action(action)
+    # They called, so nothing is learned about their raising.
+    shown = [A.reveal_card(Card.parse("7C"), 1),
+             A.reveal_card(Card.parse("2D"), 1)]
+    model.end_game(moves + deal + shown, GameStateView(state))
+    assert model.shown == {}
+
+    model = bot_with("AS AH", 1)
+    model.seat_chips = (500, 500)
+    state = GameState([500, 500], teams=["them", "us"])
+    moves = [A.raise_to(0, 500), A.call(1)]
+    for move in moves:
+        state.process_action(move)
+    for action in deal:
+        state.process_action(action)
+    shown = [A.reveal_card(Card.parse("7C"), 0),
+             A.reveal_card(Card.parse("2D"), 0)]
+    model.end_game(moves + deal + shown, GameStateView(state))
+    assert model.shown == {"them": [1.0, PERCENTILE["72o"]]}
 
 
 def _call_share(hands_seen: int, shoves: int) -> float:
