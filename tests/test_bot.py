@@ -120,6 +120,110 @@ def test_all_ins_are_called_on_equity():
     assert decide("7C 2D", 1, shove) == A.fold(1)
 
 
+def _seen_shoving(model: Model, team: str, shoves: int, hands: int):
+    model.big_raises[team] = [hands, shoves]
+
+
+def test_the_first_shove_gets_a_wide_prior_not_a_tight_range():
+    assert 0.3 <= Model()._big_raise_rate("seat 0") <= 0.5
+    limit = _shove_limit(Model())
+    assert limit == Model()._big_raise_rate("seat 0")
+
+
+def _shove_limit(model: Model) -> float:
+    model.seed(cards("AS AH"), 1)
+    moves = (A.raise_to(0, 500),)
+    model.log = log_of(*moves)
+    return model._range_limit(GameStateView(table(*moves)))
+
+
+def test_the_range_follows_how_often_they_shove():
+    always, never = Model(), Model()
+    _seen_shoving(always, "seat 0", 40, 40)
+    _seen_shoving(never, "seat 0", 0, 200)
+    assert _shove_limit(always) > 0.9
+    assert _shove_limit(never) == bot.TIGHTEST_RANGE
+
+
+def _call_share(hands_seen: int, shoves: int) -> float:
+    """The share of hands that call a shove from the big blind."""
+    shove = A.raise_to(0, 500)
+    calling = 0
+    for name, share in list(PERCENTILE.items())[::8]:
+        model = Model()
+        model.strict = True
+        _seen_shoving(model, "seat 0", shoves, hands_seen)
+        first = Card(name[0], "S")
+        second = Card(name[1], "S" if name.endswith("s") else "H")
+        model.seed([first, second], 1)
+        action = model.run([shove], GameStateView(table(shove)))
+        if action.kind == "call":
+            calling = max(calling, share)
+    return calling
+
+
+def test_top_half_calls_an_always_shover_but_not_a_rare_one():
+    assert 0.45 <= _call_share(40, 40) <= 0.65
+    assert _call_share(200, 1) <= 0.12
+
+
+def test_against_a_shover_the_button_shoves_or_folds_never_raises_small():
+    def first_move(hand):
+        model = bot_with(hand, 0)
+        _seen_shoving(model, "seat 1", 40, 40)
+        return model.run([], GameStateView(table()))
+
+    assert first_move("AS KD") == A.raise_to(0, 500)
+    assert first_move("7C 2D") == A.fold(0)
+
+
+def test_end_game_counts_big_raises_per_team():
+    state = GameState([500, 500], teams=["us", "them"])
+    model = bot_with("AS AH", 0)
+    shove = A.raise_to(1, 500)
+    model.seat_chips = (500, 500)
+    model.log = [A.raise_to(0, 50)]
+    state.process_action(A.raise_to(0, 50))
+    state.process_action(shove)
+    state.process_action(A.fold(0))
+    model.end_game([shove, A.fold(0), A.win(1, 550)], GameStateView(state))
+    assert model.big_raises == {"them": [1, 1]}
+    model.seed(cards("7C 2D"), 0)
+    model.end_game([A.fold(0), A.win(1, 30)], GameStateView(state))
+    assert model.big_raises == {"them": [1, 1]}  # they never had to act
+
+
+def test_an_ordinary_raise_is_not_big():
+    state = GameState([500, 500], teams=["them", "us"])
+    model = bot_with("AS AH", 1)
+    model.seat_chips = (500, 500)
+    state.process_action(A.raise_to(0, 50))
+    state.process_action(A.fold(1))
+    model.end_game([A.raise_to(0, 50), A.fold(1), A.win(0, 70)],
+                   GameStateView(state))
+    assert model.big_raises == {"them": [1, 0]}
+
+
+def test_our_own_shove_does_not_count_as_them_not_raising():
+    state = GameState([500, 500], teams=["us", "them"])
+    model = bot_with("AS AH", 0)
+    model.seat_chips = (500, 500)
+    shove = A.raise_to(0, 500)
+    state.process_action(shove)
+    state.process_action(A.fold(1))
+    model.end_game([shove, A.fold(1), A.win(0, 520)], GameStateView(state))
+    assert model.big_raises == {}
+
+
+def test_a_learned_shover_is_found_within_a_hand_or_two_of_play(quick_sim):
+    model = _strict_model()
+    other = DUMMIES["shove"](seed=1)
+    _play([model, other], 12, (500, 500), "learn")
+    hands, big = model.big_raises["seat 1"]
+    assert hands == big and hands > 0
+    assert model._big_raise_rate("seat 1") > 0.6
+
+
 def test_a_short_stack_shoves_or_folds():
     short = (120, 120)  # 6 big blinds
     assert decide("AS AH", 0, stacks=short) == A.raise_to(0, 120)

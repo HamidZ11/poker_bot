@@ -1,7 +1,7 @@
 """
-The bot, Stage 1: preflop charts by depth, then equity against an estimated
-range for pot-odds calls and value bets. It does not bluff and learns nothing
-between hands.
+The bot: preflop charts by depth, then equity against an estimated range for
+pot-odds calls and value bets. It does not bluff. The only thing it learns
+between hands is how often each opponent shoves or raises big.
 
 The charts and thresholds are starting values, tuned against heads-up play at
 25 big blinds. With more players the same charts are tightened.
@@ -34,7 +34,13 @@ BIG_CALL = 0.33  # a preflop call above this share of the stack is priced
 RAISED_RANGE = {1: 0.70, 2: 0.20, 3: 0.08}
 CALLED_RANGE = {0: 1.00, 1: 0.60, 2: 0.30, 3: 0.12}
 TIGHTEST_RANGE = 0.05
-SHOVE_RANGE = 0.20  # a preflop all-in with at most one raise before it
+
+# How wide a big preflop raise is, learned per opponent: the share of hands
+# they do it with, starting from a wide guess worth a few hands.
+BIG_RAISE = 1 / 3  # a raise to this share of their stack counts as big
+BIG_RAISE_PRIOR = 0.40
+BIG_RAISE_WEIGHT = 5
+SHOVE_HAPPY = 0.50  # from this rate on, raising small only gets shoved on
 
 
 def hand_key(first: Card, second: Card) -> str:
@@ -69,13 +75,19 @@ class Model:
     Attributes are plain data, as the model is pickled. errors counts the
     exceptions caught; with strict set they are raised again, so a test
     sees a bug that would otherwise look like a quiet check or fold.
+    big_raises holds [hands they acted in, hands they raised big in] per
+    team: the one thing kept from hand to hand.
     """
 
     def __init__(self):
         self.hand = []
         self.player_id = None
+        self.hand_name = ""
         self.percentile = 1.0  # the hole cards' strength; 1.0 is the weakest
         self.log = []  # every action this hand, oldest first
+        self.seat_chips = ()  # each seat's chips when the hand began
+        self.big_raises = {}
+        self.preflop_equity = {}  # (hand, range width): equity, a cache
         self.rng = random.Random(20261107)
         self.errors = 0
         self.strict = False
@@ -84,9 +96,12 @@ class Model:
         self.hand = hand
         self.player_id = player_id
         self.log = []
+        self.seat_chips = ()
         self.percentile = 1.0
+        self.hand_name = ""
         try:
-            self.percentile = PERCENTILE[hand_key(hand[0], hand[1])]
+            self.hand_name = hand_key(hand[0], hand[1])
+            self.percentile = PERCENTILE[self.hand_name]
         except Exception:
             self.errors += 1
             if self.strict:
@@ -97,6 +112,11 @@ class Model:
     ) -> PlayerAction:
         try:
             self.log.extend(actions)
+            if not self.seat_chips and game_state.street == "preflop":
+                self.seat_chips = tuple(
+                    stack + bet for stack, bet in
+                    zip(game_state.stacks, game_state.bets)
+                )
             action = self._decide(game_state)
             game_state.validate_action(action)
             return action
@@ -105,6 +125,60 @@ class Model:
             if self.strict:
                 raise
             return self._check_or_fold(game_state)
+
+    def end_game(
+        self, actions: list[PlayerAction], game_state: GameStateView
+    ):
+        """Counts this hand for every opponent: only here is it complete."""
+        try:
+            self.log.extend(actions)
+            self._count_big_raises(game_state)
+        except Exception:
+            self.errors += 1
+            if self.strict:
+                raise
+
+    # -- what we keep between hands ------------------------------------------
+
+    def _is_big(self, action: PlayerAction) -> bool:
+        seat = action.player_id
+        return (
+            action.kind == "raise"
+            and seat < len(self.seat_chips)
+            and action.amount >= BIG_RAISE * self.seat_chips[seat]
+        )
+
+    def _is_all_in(self, action: PlayerAction) -> bool:
+        seat = action.player_id
+        return (
+            action.kind == "raise"
+            and seat < len(self.seat_chips)
+            and action.amount >= self.seat_chips[seat]
+        )
+
+    def _count_big_raises(self, gs: GameStateView):
+        acted = set()
+        big = set()
+        for action in self.log:
+            if action.player_id == DEALER:
+                break  # the flop: preflop betting is over
+            if action.kind in ("fold", "call", "raise"):
+                acted.add(action.player_id)
+                if self._is_big(action):
+                    big.add(action.player_id)
+                if self._is_all_in(action):
+                    break  # nobody after this could have raised
+        for seat in acted:
+            if seat != self.player_id:
+                counts = self.big_raises.setdefault(gs.teams[seat], [0, 0])
+                counts[0] += 1
+                counts[1] += seat in big
+
+    def _big_raise_rate(self, team: str) -> float:
+        """The share of hands this team raises big with, so far."""
+        hands, big = self.big_raises.get(team, (0, 0))
+        prior = BIG_RAISE_PRIOR * BIG_RAISE_WEIGHT
+        return (big + prior) / (hands + BIG_RAISE_WEIGHT)
 
     # -- moves ---------------------------------------------------------------
 
@@ -166,6 +240,11 @@ class Model:
     def _first_in(self, gs, hand: float, depth: float) -> PlayerAction:
         """Nobody has raised and we owe chips: raise or fold, never limp."""
         big_blind = gs.big_blind
+        others = [p for p in gs.players_in_hand if p != self.player_id]
+        if len(others) == 1:
+            rate = self._big_raise_rate(gs.teams[others[0]])
+            if rate >= SHOVE_HAPPY:
+                return self._against_a_shover(gs, rate)
         if depth <= 10:
             share = 0.85 if depth <= 5 else 0.68 if depth <= 8 else 0.58
             return self._shove(gs) if hand <= share else self._check_or_fold(gs)
@@ -179,6 +258,15 @@ class Model:
             return self._check_or_fold(gs)
         if hand <= 0.75:
             return self._raise_to(gs, 2.5 * big_blind)
+        return self._check_or_fold(gs)
+
+    def _against_a_shover(self, gs, rate: float) -> PlayerAction:
+        """Any raise of ours gets shoved on, so a hand that would fold to
+        that folds now, for less, and one that would call may as well shove."""
+        chips = gs.stacks[self.player_id] + gs.bets[self.player_id]
+        price = gs.stacks[self.player_id] / (2 * chips)
+        if self._equity(gs, rate) > price + ALL_IN_MARGIN:
+            return self._shove(gs)
         return self._check_or_fold(gs)
 
     def _after_limps(self, gs, hand: float, depth: float) -> PlayerAction:
@@ -320,12 +408,15 @@ class Model:
         return max(keep, 0.12), rest, cap
 
     def _weighted_hands(
-        self, gs: GameStateView, board: list[Card], deadline: float
+        self,
+        gs: GameStateView,
+        board: list[Card],
+        deadline: float,
+        limit: float,
     ) -> list[tuple[float, Card, Card, tuple | None]]:
         """The opponent's possible hands as (weight, first, second, rank):
         rank is theirs on this board, None before the flop."""
         dead = set(self.hand) | set(board)
-        limit = self._range_limit(gs)
         hands = [
             (1.0 if strength <= limit else OUTSIDE_RANGE, first, second)
             for first, second, strength in COMBOS
@@ -356,28 +447,50 @@ class Model:
         return adjusted
 
     def _range_limit(self, gs: GameStateView) -> float:
-        limit = self._preflop_range()
+        """The share of hands the opponent can hold: from how often they do
+        this if they just raised big preflop, else from the betting."""
         if gs.street == "preflop":
-            others = [p for p in gs.players_in_hand if p != self.player_id]
-            shoved = any(gs.status(p) == "all_in" for p in others)
-            raises = sum(a.kind == "raise" for a in self.log)
-            if shoved and raises <= 2:
-                return SHOVE_RANGE
-        return limit
+            for action in reversed(self.log):
+                if action.kind == "raise":
+                    seat = action.player_id
+                    if seat != self.player_id and (
+                        self._is_big(action) or gs.status(seat) == "all_in"
+                    ):
+                        rate = self._big_raise_rate(gs.teams[seat])
+                        return max(TIGHTEST_RANGE, rate)
+                    break
+        return self._preflop_range()
 
-    def _equity(self, gs: GameStateView) -> float:
-        """Our share of the pot against the opponent's weighted hands. With
-        several opponents, roughly: we must beat each one."""
+    def _equity(self, gs: GameStateView, limit: float | None = None) -> float:
+        """Our share of the pot against the opponent's weighted hands, whose
+        range is limit wide (read from the betting if None). With several
+        opponents, roughly: we must beat each one."""
         start = time.perf_counter()
         board = list(gs.board)
-        if len(board) == 5:  # ranking every hand is the whole job
-            hands = self._weighted_hands(gs, board, start + SIM_CAP)
+        if limit is None:
+            limit = self._range_limit(gs)
+        if not board:
+            equity = self._preflop_sim(gs, limit, start)
+        elif len(board) == 5:  # ranking every hand is the whole job
+            hands = self._weighted_hands(gs, board, start + SIM_CAP, limit)
             equity = self._river_equity(hands, board)
         else:
-            hands = self._weighted_hands(gs, board, start + SIM_CAP / 2)
+            hands = self._weighted_hands(gs, board, start + SIM_CAP / 2, limit)
             equity = self._simulate(hands, board, start + SIM_CAP)
         opponents = len(gs.players_in_hand) - 1
         return equity ** opponents
+
+    def _preflop_sim(self, gs: GameStateView, limit: float, start: float):
+        """Preflop equity depends only on the hand and the range, so each
+        pair is simulated once, with the range rounded to a 5% step."""
+        limit = round(limit * 20) / 20
+        key = (self.hand_name, limit)
+        if key not in self.preflop_equity:
+            hands = self._weighted_hands(gs, [], start + SIM_CAP, limit)
+            self.preflop_equity[key] = self._simulate(
+                hands, [], start + SIM_CAP
+            )
+        return self.preflop_equity[key]
 
     def _river_equity(self, hands, board: list[Card]) -> float:
         """Exact: every hand they could hold is already ranked."""
