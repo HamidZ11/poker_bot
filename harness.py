@@ -153,10 +153,10 @@ def variants() -> dict[str, type]:
     return {
         "bot-self": _variant("model:Model"),
         "bot-stage1": _variant("bot_stage1:Model"),
-        "bot-tight": _variant("model:Model", VALUE_BET=0.68, VALUE_RAISE=0.82,
-                              CALL_MARGIN=0.08, CHART_SCALE=0.7),
-        "bot-loose": _variant("model:Model", VALUE_BET=0.54, VALUE_RAISE=0.68,
-                              CALL_MARGIN=0.0, CHART_SCALE=1.25),
+        "bot-tight": _variant("model:Model", VALUE_BET=0.60, VALUE_RAISE=0.75,
+                              CALL_MARGIN=0.04, CHART_SCALE=1.0),
+        "bot-loose": _variant("model:Model", VALUE_BET=0.50, VALUE_RAISE=0.64,
+                              CALL_MARGIN=0.0, CHART_SCALE=1.33),
     }
 
 

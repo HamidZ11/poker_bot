@@ -99,10 +99,10 @@ class Model:
     postflop bet, those that were weak].
     """
 
-    VALUE_BET = 0.60  # equity to bet when checked to
-    VALUE_RAISE = 0.75  # equity to raise a bet
-    CALL_MARGIN = 0.04  # equity above the pot odds to call a bet postflop
-    CHART_SCALE = 1.0  # above 1 plays more hands preflop, below 1 fewer
+    VALUE_BET = 0.54  # equity to bet when checked to
+    VALUE_RAISE = 0.68  # equity to raise a bet
+    CALL_MARGIN = 0.0  # equity above the pot odds to call a bet postflop
+    CHART_SCALE = 1.25  # above 1 plays more hands preflop, below 1 fewer
 
     def __init__(self):
         self.hand = []
