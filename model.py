@@ -17,11 +17,11 @@ from player_action import DEALER, PlayerAction
 from preflop_ranges import RANGE_EQUITY, RANGE_STEPS
 from preflop_table import PERCENTILE
 
-# Seconds for one equity estimate, range building included. The limit is 120
+# Seconds for one equity estimate, range building included. The limit is 100
 # ms: the clock is only read now and then, so the deadline sits below it.
-SIM_CAP = 0.10
+SIM_CAP = 0.085
 CHECK_EVERY = 50  # trials or hands between looks at the clock
-SIM_TRIALS = 800
+SIM_TRIALS = 600
 
 ALL_IN_MARGIN = 0.01  # the same preflop, where nothing is left to lose later
 THREE_BET_MARGIN = 0.08  # the same for calling a three-bet, with streets to come

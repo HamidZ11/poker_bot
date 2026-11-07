@@ -143,6 +143,8 @@ def _variant(class_path: str, **values):
         def __init__(self, seed=None):
             super().__init__()
             self.rng = random.Random(seed)
+            if "HARNESS_TRIALS" in os.environ:
+                self.sim_trials = int(os.environ["HARNESS_TRIALS"])
 
     for key, value in values.items():
         setattr(Variant, key, value)
@@ -153,6 +155,7 @@ def variants() -> dict[str, type]:
     return {
         "bot-self": _variant("model:Model"),
         "bot-stage1": _variant("bot_stage1:Model"),
+        "bot-stage2": _variant("bot_stage2:Model"),
         "bot-tight": _variant("model:Model", VALUE_BET=0.60, VALUE_RAISE=0.75,
                               CALL_MARGIN=0.04, CHART_SCALE=1.0),
         "bot-loose": _variant("model:Model", VALUE_BET=0.50, VALUE_RAISE=0.64,
@@ -303,9 +306,21 @@ def main():
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() - 1))
     parser.add_argument("--baseline", metavar="MODEL",
                         help="also play this model and report the change")
+    parser.add_argument("--cache", metavar="FOLDER",
+                        help="keep the baseline's logs here between runs")
     parser.add_argument("--diagnose", action="store_true",
                         help="show net by seat and folds of the best hand")
     args = parser.parse_args()
+    if args.trials is not None:
+        os.environ["HARNESS_TRIALS"] = str(args.trials)
+    # Bots built on the model change with it, so no baseline applies to them.
+    compared = [n for n in args.opponents if not n.startswith("bot-")]
+
+    def cache_path(name):
+        if not args.cache:
+            return None
+        label = f"{args.baseline}-{name}-{args.seed}-{args.matches}-{args.trials}"
+        return os.path.join(args.cache, label.replace(":", "_") + ".pkl")
 
     with tempfile.TemporaryDirectory() as folder:
         pkl = build_pickle(args.model, folder, args.trials)
@@ -322,13 +337,19 @@ def main():
                 ]
                 for name in args.opponents
             }
-            base_futures = {
-                name: [
-                    executor.submit(play_one, base_pkl, name, args.seed + m)
-                    for m in range(args.matches)
-                ]
-                for name in args.opponents if base_pkl
-            }
+            base_futures = {}
+            cached = {}
+            for name in compared if base_pkl else []:
+                path = cache_path(name)
+                if path and os.path.exists(path):
+                    with open(path, "rb") as file:
+                        cached[name] = pickle.load(file)
+                else:
+                    base_futures[name] = [
+                        executor.submit(play_one, base_pkl, name,
+                                        args.seed + m)
+                        for m in range(args.matches)
+                    ]
             print(f"{args.model}: {args.matches} matches of {DEALS} deals "
                   f"from both seats, {STACK // 20} bb")
             print(f"{'opponent':<16}{'bb/100':>18}{'verdict':>9}{'hands':>7}"
@@ -351,8 +372,13 @@ def main():
                     for _, part in played:
                         merge(total, part)
                     print_diagnosis(total)
-                if base_pkl:
-                    base = [f.result()[0] for f in base_futures[name]]
+                if base_pkl and name in compared:
+                    base = cached.get(name)
+                    if base is None:
+                        base = [f.result()[0] for f in base_futures[name]]
+                        if cache_path(name):
+                            with open(cache_path(name), "wb") as file:
+                                pickle.dump(base, file)
                     change, error = paired_change([log for log, _ in played],
                                                   base)
                     changes.append(change)
@@ -366,8 +392,8 @@ def main():
                   f"{math.sqrt(squares) / count:<5.1f}")
             if changes:
                 print(f"pool change vs {args.baseline}: "
-                      f"{sum(changes) / count:+.1f} ± "
-                      f"{math.sqrt(change_squares) / count:.1f}")
+                      f"{sum(changes) / len(changes):+.1f} ± "
+                      f"{math.sqrt(change_squares) / len(changes):.1f}")
 
 
 if __name__ == "__main__":
