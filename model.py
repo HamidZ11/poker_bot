@@ -17,7 +17,9 @@ from player_action import DEALER, PlayerAction
 from preflop_ranges import RANGE_EQUITY, RANGE_STEPS
 from preflop_table import PERCENTILE
 
-SIM_CAP = 0.12  # seconds for one equity estimate, range building included
+# Seconds for one equity estimate, range building included. The limit is 120
+# ms: the clock is only read now and then, so the deadline sits below it.
+SIM_CAP = 0.10
 CHECK_EVERY = 50  # trials or hands between looks at the clock
 SIM_TRIALS = 800
 
