@@ -57,13 +57,33 @@ class MinRaiser(_Bot):
         return self._raise_to(game_state, game_state.min_raise_to)
 
 
-class Maniac(_Bot):
+class Repeatable:
+    """Fresh randomness each hand, from the seed and the cards. Without it
+    one extra draw in one hand shifts every hand after it, and two versions
+    of a model stop being comparable hand for hand."""
+
+    def __init__(self, seed=None, **kwargs):
+        super().__init__(seed, **kwargs)
+        self.base_seed = seed
+        self.hands_seen = 0
+
+    def seed(self, hand, player_id):
+        super().seed(hand, player_id)
+        self.hands_seen += 1
+        self.rng = random.Random(f"{self.base_seed}:{self.hands_seen}:{hand}")
+
+
+class RepeatableRandom(Repeatable, dummies.RandomBot):
+    """dummies.RandomBot, repeatable."""
+
+
+class RepeatableEquity(Repeatable, dummies.EquityBot):
+    """dummies.EquityBot, repeatable."""
+
+
+class Maniac(Repeatable, _Bot):
     """Plays any two cards hard: mostly pot-sized raises, some shoves, and
     it hardly ever folds."""
-
-    def __init__(self, seed=None):
-        super().__init__(seed)
-        self.rng = random.Random(seed)
 
     def run(self, actions, game_state):
         roll = self.rng.random()
@@ -131,7 +151,11 @@ ARCHETYPES = {
     "nit": Nit,
     "over-folder": OverFolder,
 }
-SPARRING = ("random", "tight", "equity")
+SPARRING = {
+    "random": RepeatableRandom,
+    "tight": dummies.TightBot,
+    "equity": RepeatableEquity,
+}
 
 
 def _variant(class_path: str, **values):
@@ -167,6 +191,7 @@ def register():
     """Makes every bot here playable by name, as dummies are. Runs on import,
     so the worker processes of this harness have them too."""
     dummies.DUMMIES.update(ARCHETYPES)
+    dummies.DUMMIES.update(SPARRING)
     dummies.DUMMIES.update(variants())
 
 

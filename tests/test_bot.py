@@ -413,6 +413,139 @@ def test_several_opponents_lower_the_equity():
     assert three_way < model._equity(GameStateView(heads_up))
 
 
+# -- the opponent model --------------------------------------------------------
+
+
+def _scored(*moves, hand="AS AH", seat=1, shown=()):
+    """A model that has scored one hand in seat, played as moves."""
+    model = bot_with(hand, seat)
+    state = table(*moves)
+    model.end_game(log_of(*moves) + list(shown), GameStateView(state))
+    return model._stats_of("seat 0" if seat else "seat 1")
+
+
+def test_vpip_counts_chips_put_in_by_choice():
+    stats = _scored(A.raise_to(0, 50), A.fold(1))
+    assert (stats["hands"], stats["vpip"], stats["pfr"]) == (1, 1, 1)
+    stats = _scored(A.fold(0))
+    assert (stats["hands"], stats["vpip"], stats["pfr"]) == (1, 0, 0)
+    stats = _scored(A.call(0), A.call(1), "KC 7D 2H", A.call(1), A.call(0),
+                    hand="AS AH", seat=1)
+    assert (stats["vpip"], stats["pfr"]) == (1, 0)  # the button limped in
+
+
+def test_a_big_blind_checking_is_not_vpip():
+    stats = _scored(A.call(0), A.call(1), hand="AS AH", seat=0)
+    assert (stats["hands"], stats["vpip"]) == (1, 0)
+
+
+def test_folds_to_our_raises_are_counted_each_side_of_the_flop():
+    stats = _scored(A.raise_to(0, 50), A.raise_to(1, 150), A.fold(0))
+    assert (stats["pre_chances"], stats["pre_folds"]) == (1, 1)
+    stats = _scored(A.call(0), A.call(1), "KC 7D 2H", A.raise_to(1, 20),
+                    A.fold(0))
+    assert (stats["post_chances"], stats["post_folds"]) == (1, 1)
+    assert stats["pre_chances"] == 0
+    stats = _scored(A.call(0), A.call(1), "KC 7D 2H", A.raise_to(1, 20),
+                    A.call(0))
+    assert (stats["post_chances"], stats["post_folds"]) == (1, 0)
+    assert stats["passive"] == 1
+
+
+def test_a_fold_to_someone_else_or_a_check_is_no_chance():
+    stats = _scored(A.call(0), A.call(1), "KC 7D 2H", A.call(1), A.call(0))
+    assert stats["post_chances"] == 0 and stats["passive"] == 0
+
+
+def test_postflop_bets_are_aggressive():
+    stats = _scored(A.call(0), A.call(1), "KC 7D 2H", A.call(1),
+                    A.raise_to(0, 20), A.fold(1), hand="AS AH", seat=1)
+    assert stats["aggressive"] == 1
+
+
+def test_the_fold_rate_starts_at_the_prior_and_moves_by_twenty_observations():
+    model = Model()
+    assert model._fold_rate("them") == pytest.approx(bot.FOLD_PRIOR)
+    stats = model._stats_of("them")
+    stats["post_chances"] = stats["post_folds"] = 20
+    assert model._fold_rate("them") == pytest.approx(
+        (20 + bot.FOLD_PRIOR * 20) / 40)
+
+
+# -- bluffs --------------------------------------------------------------------
+
+
+AIR_FLOP = (*LIMPED, "KC 7D 2H")
+
+
+def _bluffs(hand, moves, seat, fold_rate, equity, tries=1500):
+    """How often the bot bluffs here, against that fold rate."""
+    model = bot_with(hand, seat)
+    stats = model._stats_of("seat 0" if seat else "seat 1")
+    stats["post_chances"] = 100_000
+    stats["post_folds"] = int(fold_rate * 100_000)
+    view = GameStateView(table(*moves))
+    made = sum(model._bluff(view, equity) is not None for _ in range(tries))
+    return made / tries
+
+
+def test_no_bluff_before_we_have_seen_them_answer_a_bet():
+    model = bot_with("5C 4D", 1)
+    view = GameStateView(table(*AIR_FLOP))
+    assert all(model._bluff(view, 0.2) is None for _ in range(500))
+    assert model.bluff_spots == 0
+
+
+def test_no_bluff_below_break_even_plus_the_margin():
+    # A half pot bet needs 1/3 folds, plus 5%.
+    assert _bluffs("5C 4D", AIR_FLOP, 1, 0.35, 0.2, tries=300) == 0
+    assert _bluffs("5C 4D", AIR_FLOP, 1, 0.40, 0.2, tries=1500) > 0
+
+
+def test_a_draw_bluffs_far_more_often_than_air():
+    flush_draw = (*LIMPED, "KC 7C 2H")
+    draw = _bluffs("AC 4C", flush_draw, 1, 0.6, 0.45)
+    air = _bluffs("5H 4D", AIR_FLOP, 1, 0.6, 0.2)
+    assert 0.3 < draw < 0.6
+    assert 0.02 < air < 0.08
+
+
+def test_a_made_hand_with_showdown_value_does_not_bluff():
+    assert _bluffs("9C 8D", AIR_FLOP, 1, 0.9, 0.48, tries=300) == 0
+
+
+def test_the_bet_is_counted_in_the_break_even():
+    model = bot_with("5C 4D", 1)
+    view = GameStateView(table(*AIR_FLOP))
+    action = model._pot_raise(view, bot.BLUFF_SIZE)
+    assert action == A.raise_to(1, 20)  # half of 40, at least the minimum
+
+
+def test_several_opponents_are_never_bluffed():
+    state = GameState([500, 500, 500])
+    for move in (A.call(0), A.call(1), A.call(2)):
+        state.process_action(move)
+    for card in cards("KC 7D 2H"):
+        state.process_action(A.reveal_card(card))
+    model = bot_with("5C 4D", 1)
+    assert all(model._bluff(GameStateView(state), 0.2) is None
+               for _ in range(300))
+
+
+def test_draws_are_recognised():
+    def draw(hand, board):
+        return bot_with(hand, 0)._has_draw(cards(board))
+
+    assert draw("AC 4C", "KC 7C 2H")  # four to a flush
+    assert draw("9C 8D", "7H 6S 2C")  # open ended
+    assert not draw("AC 4D", "KC 7C 2H")
+    assert not draw("9C 8D", "7H 2S 2C")  # only three to a straight
+    assert not draw("AH KD", "QS JC 2C")  # three to the ace: one end shut
+    assert not draw("AC 4C", "KC 7C 2H 9D 3S")  # no card to come
+    assert not draw("2H 3H", "KC KD KS KH")
+    assert not draw("9D 3S", "8C 7C 6C 5C")  # the board's draw, no hole card
+
+
 # -- sizing --------------------------------------------------------------------
 
 

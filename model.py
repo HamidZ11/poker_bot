@@ -1,8 +1,8 @@
 """
 The bot: preflop charts by depth, then equity against an estimated range for
-pot-odds calls and value bets. It does not bluff. The only thing it learns
-between hands is how often each opponent raises big preflop and how good
-their raising hands turn out to be, and how often they bet after the flop.
+pot-odds calls and value bets, with a few bluffs when the fold rate pays for
+them. Between hands it learns each opponent's habits by team name: see
+_score_hand and the counters kept in Model.
 
 The charts and thresholds are starting values, tuned against heads-up play at
 25 big blinds. With more players the same charts are tightened.
@@ -19,7 +19,7 @@ from preflop_table import PERCENTILE
 
 # Seconds for one equity estimate, range building included. The limit is 100
 # ms: the clock is only read now and then, so the deadline sits below it.
-SIM_CAP = 0.085
+SIM_CAP = 0.08
 CHECK_EVERY = 50  # trials or hands between looks at the clock
 SIM_TRIALS = 600
 
@@ -61,6 +61,20 @@ WEAK_SHOWN_PRIOR = 0.15
 WEAK_SHOWN_WEIGHT = 6
 RECKLESS_WEAK_SHOWN = 0.45  # share of weak hands at which it has gone
 
+# Each opponent's habits start from these rates, worth this many observations.
+PRIOR_WEIGHT = 20
+FOLD_PRIOR = 0.45  # folding to our bet or raise
+
+# A bluff needs the fold rate to beat the break-even bet / (bet + pot) by
+# BLUFF_MARGIN. Then it happens in about 5-10% of such spots: draws far more
+# often than air, and more against opponents who fold well above the line.
+BLUFF_MARGIN = 0.05
+BLUFF_SIZE = 0.5  # of the pot
+DRAW_BLUFF = 0.20
+AIR_BLUFF = 0.02
+AIR_MAX_EQUITY = 0.40  # above this a hand can win without betting
+MIN_FOLD_CHANCES = 8  # bets of ours they have answered before we bluff at all
+
 
 def hand_key(first: Card, second: Card) -> str:
     """A starting hand's name in preflop_table: "AA", "AKs" or "AKo"."""
@@ -97,8 +111,10 @@ class Model:
     Kept from hand to hand, per team: big_raises, [hands they acted in,
     hands they raised big in], and shown, [weight, weighted percentile] of
     the hands they showed after a preflop raise, bets, [postflop turns,
-    turns they bet or raised on], and bet_shown, [hands shown after a
-    postflop bet, those that were weak].
+    turns they bet or raised on], bet_shown, [hands shown after a postflop
+    bet, those that were weak], and stats, the counts from _score_hand.
+    bluff_spots and bluffs count where a bluff was allowed and where it
+    was made.
     """
 
     VALUE_BET = 0.54  # equity to bet when checked to
@@ -117,14 +133,22 @@ class Model:
         self.shown = {}
         self.bets = {}
         self.bet_shown = {}
+        self.stats = {}
+        self.bluff_spots = 0
+        self.bluffs = 0
         self.sim_trials = SIM_TRIALS
         self.rng = random.Random(20261107)
+        self.hands_seen = 0
         self.errors = 0
         self.strict = False
 
     def seed(self, hand: list[Card], player_id: int):
         self.hand = hand
         self.player_id = player_id
+        # Fresh randomness each hand: what happens in one hand cannot shift
+        # the next, so two versions compare hand for hand on the same decks.
+        self.hands_seen += 1
+        self.rng.seed(f"{self.hands_seen}:{hand}")
         self.log = []
         self.seat_chips = ()
         self.percentile = 1.0
@@ -165,6 +189,7 @@ class Model:
             self._count_big_raises(game_state)
             self._count_shown_hands(game_state)
             self._count_bets(game_state)
+            self._score_hand(game_state)
         except Exception:
             self.errors += 1
             if self.strict:
@@ -225,6 +250,81 @@ class Model:
                 counts = self.shown.setdefault(gs.teams[seat], [0.0, 0.0])
                 counts[0] += weight
                 counts[1] += weight * percentile
+
+    def _score_hand(self, gs: GameStateView):
+        """
+        Replays the hand into each opponent's stats: hands, vpip and pfr
+        (hands they put chips in by choice, and raised, preflop), folds to
+        our raises on each side of the flop out of the chances to, and
+        aggressive and passive postflop moves.
+        """
+        count = gs.num_players
+        small = gs.button if count == 2 else (gs.button + 1) % count
+        bets = [0] * count
+        bets[small] = gs.small_blind
+        bets[(small + 1) % count] = gs.big_blind
+        current = gs.big_blind
+        raiser = None
+        reveals = 0
+        played = set()
+        voluntary = set()
+        raised = set()
+        for action in self.log:
+            seat = action.player_id
+            if seat == DEALER:
+                reveals += 1
+                if reveals >= 3:
+                    bets = [0] * count
+                    current = 0
+                    raiser = None
+                continue
+            if action.kind not in ("fold", "call", "raise"):
+                continue
+            if seat != self.player_id:
+                played.add(seat)
+                stats = self._stats_of(gs.teams[seat])
+                side = "pre" if reveals < 3 else "post"
+                if raiser == self.player_id:
+                    stats[side + "_chances"] += 1
+                    stats[side + "_folds"] += action.kind == "fold"
+                owed = current - bets[seat]
+                if reveals < 3:
+                    if action.kind == "raise":
+                        raised.add(seat)
+                    if action.kind == "raise" or (
+                        action.kind == "call" and owed > 0
+                    ):
+                        voluntary.add(seat)
+                elif action.kind == "raise":
+                    stats["aggressive"] += 1
+                elif action.kind == "call" and owed > 0:
+                    stats["passive"] += 1
+            if action.kind == "raise":
+                bets[seat] = action.amount
+                current = max(current, action.amount)
+                raiser = seat
+            elif action.kind == "call":
+                bets[seat] = current
+        for seat in played:
+            stats = self._stats_of(gs.teams[seat])
+            stats["hands"] += 1
+            stats["vpip"] += seat in voluntary
+            stats["pfr"] += seat in raised
+
+    def _stats_of(self, team: str) -> dict:
+        return self.stats.setdefault(team, {
+            "hands": 0, "vpip": 0, "pfr": 0,
+            "pre_chances": 0, "pre_folds": 0,
+            "post_chances": 0, "post_folds": 0,
+            "aggressive": 0, "passive": 0,
+        })
+
+    def _fold_rate(self, team: str, side: str = "post") -> float:
+        """The share of our raises this team folds to, on that side of the
+        flop, starting from the prior."""
+        stats = self._stats_of(team)
+        folds = stats[side + "_folds"] + FOLD_PRIOR * PRIOR_WEIGHT
+        return folds / (stats[side + "_chances"] + PRIOR_WEIGHT)
 
     def _count_bets(self, gs: GameStateView):
         reveals = 0
@@ -455,12 +555,54 @@ class Model:
 
     def _checked_to(self, gs: GameStateView, equity: float) -> PlayerAction:
         if equity < self.VALUE_BET:
-            return PlayerAction.call(self.player_id)
+            return self._bluff(gs, equity) or PlayerAction.call(self.player_id)
         if gs.spr(self.player_id) <= 1:
             return self._shove(gs)
         return self._pot_raise(
             gs, 0.75 if equity >= self.VALUE_RAISE else 0.5
         )
+
+    def _bluff(self, gs: GameStateView, equity: float) -> PlayerAction | None:
+        """A bet with a hand that cannot bet for value, or None to check:
+        heads-up only, and only if they fold often enough to pay for it."""
+        others = [p for p in gs.players_in_hand if p != self.player_id]
+        if len(others) != 1 or not gs.can_raise:
+            return None
+        draw = self._has_draw(list(gs.board))
+        if not draw and equity >= AIR_MAX_EQUITY:
+            return None
+        action = self._pot_raise(gs, BLUFF_SIZE)
+        bet = action.amount - gs.bets[self.player_id]
+        needed = bet / (bet + gs.pot) + BLUFF_MARGIN
+        team = gs.teams[others[0]]
+        fold_rate = self._fold_rate(team)
+        if (fold_rate <= needed
+                or self._stats_of(team)["post_chances"] < MIN_FOLD_CHANCES):
+            return None
+        self.bluff_spots += 1
+        rate = DRAW_BLUFF if draw else AIR_BLUFF
+        rate *= 1 + min(1.0, (fold_rate - needed) / 0.3)
+        if self.rng.random() >= rate:
+            return None
+        self.bluffs += 1
+        return action
+
+    def _has_draw(self, board: list[Card]) -> bool:
+        """Four to a flush or an open-ended straight, using a hole card,
+        with a card still to come."""
+        if len(board) >= 5:
+            return False
+        cards = self.hand + board
+        for card in self.hand:
+            if sum(c.suit == card.suit for c in cards) == 4:
+                return True
+        values = {card.value for card in cards}
+        hole = {card.value for card in self.hand}
+        for low in range(2, 11):  # both ends open: low - 1 and low + 4 exist
+            run = set(range(low, low + 4))
+            if run <= values and run & hole:
+                return low - 1 not in values and low + 4 not in values
+        return False
 
     # -- what the opponent holds ---------------------------------------------
 

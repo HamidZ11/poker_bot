@@ -1,4 +1,8 @@
 """
+Stage 2, frozen as the harness's baseline. Not part of the submission. One
+change from commit b6367fe: fresh randomness each hand, as model.py has, so
+the two compare hand for hand.
+
 The bot: preflop charts by depth, then equity against an estimated range for
 pot-odds calls and value bets. It does not bluff. The only thing it learns
 between hands is how often each opponent raises big preflop and how good
@@ -119,12 +123,17 @@ class Model:
         self.bet_shown = {}
         self.sim_trials = SIM_TRIALS
         self.rng = random.Random(20261107)
+        self.hands_seen = 0
         self.errors = 0
         self.strict = False
 
     def seed(self, hand: list[Card], player_id: int):
         self.hand = hand
         self.player_id = player_id
+        # Fresh randomness each hand: what happens in one hand cannot shift
+        # the next, so two versions compare hand for hand on the same decks.
+        self.hands_seen += 1
+        self.rng.seed(f"{self.hands_seen}:{hand}")
         self.log = []
         self.seat_chips = ()
         self.percentile = 1.0
