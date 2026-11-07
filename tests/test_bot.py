@@ -339,6 +339,56 @@ def test_a_bet_lowers_our_equity_against_the_range():
     assert equity(betting) < equity(checked) - 0.05
 
 
+def test_a_bet_from_a_constant_bettor_narrows_the_range_less():
+    moves = (*LIMPED, "KC 7D 2H", A.raise_to(1, 40))
+
+    def equity(turns, bets):
+        model = bot_with("KD 9C", 0)
+        model.log = log_of(*moves)
+        model.bets["seat 1"] = [turns, bets]
+        return model._equity(GameStateView(table(*moves)))
+
+    assert equity(100, 80) > equity(100, 10) + 0.08
+
+
+def test_weak_hands_shown_after_betting_discount_their_bets():
+    moves = (*LIMPED, "KC 7D 2H", A.raise_to(1, 40))
+
+    def equity(shows, weak):
+        model = bot_with("KD 9C", 0)
+        model.log = log_of(*moves)
+        model.bet_shown["seat 1"] = [shows, weak]
+        return model._equity(GameStateView(table(*moves)))
+
+    assert equity(30, 20) > equity(30, 1) + 0.08
+
+
+def test_an_honest_frequent_bettor_keeps_full_respect():
+    model = Model()
+    model.bets["them"] = [100, 50]
+    model.bet_shown["them"] = [20, 2]
+    assert model._loosening("them") == 0.0
+
+
+def test_a_showdown_after_a_bet_is_judged_by_the_hand_shown():
+    moves = (*LIMPED, "KC 7D 2H", A.raise_to(1, 40), A.call(0),
+             "9S", A.call(1), A.call(0), "3C", A.call(1), A.call(0))
+    model = bot_with("KD 9C", 0)
+    state = table(*moves)
+    shown = [A.reveal_card(Card.parse("5C"), 1),
+             A.reveal_card(Card.parse("4D"), 1)]
+    model.end_game(log_of(*moves) + shown, GameStateView(state))
+    assert model.bet_shown == {"seat 1": [1, 1]}
+
+
+def test_end_game_counts_postflop_turns_only():
+    moves = (*LIMPED, "KC 7D 2H", A.raise_to(1, 40), A.fold(0))
+    model = bot_with("KD 9C", 0)
+    state = table(*moves)
+    model.end_game(log_of(*moves), GameStateView(state))
+    assert model.bets == {"seat 1": [1, 1]}
+
+
 def test_preflop_action_narrows_the_range():
     model = bot_with("AS AH", 0)
     model.log = log_of(A.raise_to(0, 50), A.raise_to(1, 150), A.call(0))

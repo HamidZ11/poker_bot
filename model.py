@@ -2,7 +2,7 @@
 The bot: preflop charts by depth, then equity against an estimated range for
 pot-odds calls and value bets. It does not bluff. The only thing it learns
 between hands is how often each opponent raises big preflop and how good
-their raising hands turn out to be.
+their raising hands turn out to be, and how often they bet after the flop.
 
 The charts and thresholds are starting values, tuned against heads-up play at
 25 big blinds. With more players the same charts are tightened.
@@ -48,6 +48,17 @@ SHOVE_HAPPY = 0.50  # from this rate on, raising small only gets shoved on
 SHOWN_WEIGHT = 3  # the rate's weight against shown hands
 SMALL_RAISE_SHOWN = 0.25  # a hand shown after a raise that was not big
 
+# A bet narrows a range less against someone who bets too often to be
+# honest, or who shows weak hands after betting. How often alone is not
+# enough: a bot that bets every good hand can bet half the time.
+BET_RATE_PRIOR = 0.35
+BET_RATE_WEIGHT = 10
+HONEST_BET_RATE = 0.55  # above this the narrowing starts to go
+RECKLESS_BET_RATE = 0.75  # at this it has gone
+WEAK_SHOWN_PRIOR = 0.15
+WEAK_SHOWN_WEIGHT = 6
+RECKLESS_WEAK_SHOWN = 0.45  # share of weak hands at which it has gone
+
 
 def hand_key(first: Card, second: Card) -> str:
     """A starting hand's name in preflop_table: "AA", "AKs" or "AKo"."""
@@ -83,7 +94,9 @@ class Model:
     sees a bug that would otherwise look like a quiet check or fold.
     Kept from hand to hand, per team: big_raises, [hands they acted in,
     hands they raised big in], and shown, [weight, weighted percentile] of
-    the hands they showed after a preflop raise.
+    the hands they showed after a preflop raise, bets, [postflop turns,
+    turns they bet or raised on], and bet_shown, [hands shown after a
+    postflop bet, those that were weak].
     """
 
     VALUE_BET = 0.60  # equity to bet when checked to
@@ -100,6 +113,8 @@ class Model:
         self.seat_chips = ()  # each seat's chips when the hand began
         self.big_raises = {}
         self.shown = {}
+        self.bets = {}
+        self.bet_shown = {}
         self.sim_trials = SIM_TRIALS
         self.rng = random.Random(20261107)
         self.errors = 0
@@ -147,6 +162,7 @@ class Model:
             self.log.extend(actions)
             self._count_big_raises(game_state)
             self._count_shown_hands(game_state)
+            self._count_bets(game_state)
         except Exception:
             self.errors += 1
             if self.strict:
@@ -207,6 +223,59 @@ class Model:
                 counts = self.shown.setdefault(gs.teams[seat], [0.0, 0.0])
                 counts[0] += weight
                 counts[1] += weight * percentile
+
+    def _count_bets(self, gs: GameStateView):
+        reveals = 0
+        bettors = set()
+        holes = {}
+        for action in self.log:
+            seat = action.player_id
+            if seat == DEALER:
+                reveals += 1
+            elif action.kind == "reveal_card":
+                holes.setdefault(seat, []).append(action.card)
+            elif (reveals >= 3 and seat != self.player_id
+                    and action.kind in ("fold", "call", "raise")):
+                counts = self.bets.setdefault(gs.teams[seat], [0, 0])
+                counts[0] += 1
+                if action.kind == "raise":
+                    counts[1] += 1
+                    bettors.add(seat)
+        board = list(gs.board)
+        for seat in bettors:
+            if len(holes.get(seat, ())) == 2 and len(board) == 5:
+                counts = self.bet_shown.setdefault(gs.teams[seat], [0, 0])
+                counts[0] += 1
+                counts[1] += self._is_weak(holes[seat], board)
+
+    def _is_weak(self, hole: list[Card], board: list[Card]) -> bool:
+        """Nothing a bet could be for value: no pair, or under the top card."""
+        rank = evaluate(hole + board)
+        top = max(card.value for card in board)
+        return rank[0] == 0 or (rank[0] == 1 and rank[1] < top)
+
+    def _bet_rate(self, team: str) -> float:
+        """The share of their postflop turns this team bets or raises on."""
+        turns, bets = self.bets.get(team, (0, 0))
+        prior = BET_RATE_PRIOR * BET_RATE_WEIGHT
+        return (bets + prior) / (turns + BET_RATE_WEIGHT)
+
+    def _weak_shown_rate(self, team: str) -> float:
+        """The share of hands shown after a bet that were weak."""
+        shows, weak = self.bet_shown.get(team, (0, 0))
+        prior = WEAK_SHOWN_PRIOR * WEAK_SHOWN_WEIGHT
+        return (weak + prior) / (shows + WEAK_SHOWN_WEIGHT)
+
+    def _loosening(self, team: str) -> float:
+        """How far to discount this team's bets, from 0 (not at all) to 1
+        (they say nothing), by the stronger of the two signs."""
+        often = (self._bet_rate(team) - HONEST_BET_RATE) / (
+            RECKLESS_BET_RATE - HONEST_BET_RATE
+        )
+        weak = (self._weak_shown_rate(team) - WEAK_SHOWN_PRIOR) / (
+            RECKLESS_WEAK_SHOWN - WEAK_SHOWN_PRIOR
+        )
+        return min(1.0, max(0.0, often, weak))
 
     def _big_raise_width(self, team: str) -> float:
         """The share of hands a big raise from this team comes from: as
@@ -448,6 +517,11 @@ class Model:
             size = gs.call_amount / max(1, gs.pot - gs.call_amount)
             keep *= 0.75 if size <= 0.5 else 0.60
             cap = 0.0
+        loosening = max(
+            self._loosening(gs.teams[p]) for p in gs.players_in_hand
+            if p != self.player_id
+        )
+        keep += (1.0 - keep) * loosening
         return max(keep, 0.12), rest, cap
 
     def _weighted_hands(
