@@ -248,6 +248,11 @@ def test_a_three_bet_is_shoved_called_or_folded():
     assert decide("7C 2D", 0, *moves) == A.fold(0)
 
 
+def test_a_min_three_bet_is_priced_not_folded():
+    moves = (A.raise_to(0, 50), A.raise_to(1, 80))
+    assert decide("9C 8D", 0, *moves) == A.call(0)
+
+
 # -- postflop ------------------------------------------------------------------
 
 

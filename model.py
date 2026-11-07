@@ -21,6 +21,7 @@ CHECK_EVERY = 50  # trials or hands between looks at the clock
 SIM_TRIALS = 800
 
 ALL_IN_MARGIN = 0.01  # the same preflop, where nothing is left to lose later
+THREE_BET_MARGIN = 0.08  # the same for calling a three-bet, with streets to come
 PREFLOP_SHOVE = 0.65  # equity to shove over a big preflop raise
 ALL_IN_SHARE = 0.85  # a raise this close to the whole stack becomes all-in
 
@@ -308,16 +309,15 @@ class Model:
         return self._check_or_fold(gs)
 
     def _against_three_bet(self, gs, hand: float, depth: float) -> PlayerAction:
-        """Our raise was raised, and calling is still cheap."""
+        """Our raise was raised, and calling is still cheap: the price
+        decides, so a min-raise is not folded to like a big three-bet."""
         if depth > 40:
             if hand <= 0.04:
                 return self._raise_to(gs, 2.3 * gs.current_bet)
-            call_share = 0.22
-        else:
-            if hand <= 0.10:
-                return self._shove(gs)
-            call_share = 0.25
-        if hand <= call_share:
+        elif hand <= 0.10:
+            return self._shove(gs)
+        equity = self._equity(gs, RAISED_RANGE[2])
+        if equity > gs.pot_odds + THREE_BET_MARGIN:
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(gs)
 

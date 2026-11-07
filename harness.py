@@ -7,6 +7,7 @@ heads-up, 25 big blinds, 200 deals per seat rotation, every deal mirrored
     .venv/bin/python harness.py                     # the whole pool
     .venv/bin/python harness.py --matches 25 --opponents shove maniac
     .venv/bin/python harness.py --model bot_stage1:Model
+    .venv/bin/python harness.py --opponents maniac --diagnose
 
 A match is 200 deals from both seats: 400 hands. --matches plays that many
 with new decks and pools them, as one match is far too noisy to read. Your
@@ -26,7 +27,7 @@ from dataclasses import replace
 
 from arena import dummies
 from arena.dummies import _Bot
-from arena.match import MatchConfig, play_match
+from arena.match import MatchConfig, _deck, play_match
 from arena.players import Player, player
 from card_utils import evaluate
 from evals.score import score
@@ -164,10 +165,101 @@ def register():
 register()
 
 
+STREETS = ("preflop", "flop", "turn", "river")
+
+
+def new_diagnosis() -> dict:
+    return {
+        "net": {"button": 0, "big blind": 0},
+        "hands": {"button": 0, "big blind": 0},
+        # per street: [folds, folds of the best hand, chips in those pots]
+        "folds": {street: [0, 0, 0] for street in STREETS},
+        # per street: [showdowns after our last call, those lost, chips lost]
+        "calls": {street: [0, 0, 0] for street in STREETS},
+    }
+
+
+def diagnose_hand(record, seed: int, diagnosis: dict):
+    """Adds one hand: where we folded, and whether the cards say we should
+    not have (the full board comes from the deck, so a fold can be judged)."""
+    me = record.seats.index("you")
+    other = 1 - me
+    result = record.result
+    role = "button" if record.button == me else "big blind"
+    diagnosis["net"][role] += result.net[me]
+    diagnosis["hands"][role] += 1
+    board = _deck(f"{seed}:{record.deal}")[4:9]
+    mine = evaluate(result.hands[me] + board)
+    theirs = evaluate(result.hands[other] + board)
+    street = 0
+    reveals = 0
+    pot = 0  # chips from earlier streets
+    bets = [0, 0]
+    last_call = None
+    for action in result.actions:
+        if action.player_id == -1:
+            reveals += 1
+            if reveals >= 3:
+                street = reveals - 2
+                pot += sum(bets)
+                bets = [0, 0]
+        elif action.kind == "raise":
+            bets[action.player_id] = action.amount
+        elif action.kind == "call":
+            if action.player_id == me:
+                last_call = STREETS[street]
+        elif action.kind == "fold" and action.player_id == me:
+            row = diagnosis["folds"][STREETS[street]]
+            row[0] += 1
+            if mine > theirs:
+                row[1] += 1
+                row[2] += pot + sum(bets)
+    showdown = any(a.kind == "reveal_card" and a.player_id >= 0
+                   for a in result.actions)
+    if showdown and last_call is not None and result.net[me] != 0:
+        row = diagnosis["calls"][last_call]
+        row[0] += 1
+        if result.net[me] < 0:
+            row[1] += 1
+            row[2] -= result.net[me]
+
+
+def merge(total: dict, part: dict):
+    for section in ("net", "hands"):
+        for key, value in part[section].items():
+            total[section][key] += value
+    for section in ("folds", "calls"):
+        for street in STREETS:
+            total[section][street] = [
+                a + b for a, b in zip(total[section][street],
+                                      part[section][street])
+            ]
+
+
+def print_diagnosis(diagnosis: dict):
+    for role, chips in diagnosis["net"].items():
+        hands = diagnosis["hands"][role]
+        rate = chips / 20 / max(1, hands) * 100
+        print(f"    {role:<10} {rate:>+8.1f} bb/100 over {hands} hands")
+    for street in STREETS:
+        folds, best, chips = diagnosis["folds"][street]
+        played, lost, cost = diagnosis["calls"][street]
+        print(f"    {street:<8} folds {folds:>5}, of the best hand {best:>4} "
+              f"(pots {chips / 20:>7.0f} bb) | showdowns after a call "
+              f"{played:>4}, lost {lost:>4} ({cost / 20:>6.0f} bb)")
+
+
 def play_one(pkl: str, opponent: str, seed: int):
-    """One match: DEALS deals from both seats, returning its log."""
+    """One match: DEALS deals from both seats. Returns its log, and what
+    the diagnosis found."""
     config = MatchConfig(deals=DEALS, seed=seed, stack=STACK)
-    return play_match([player(pkl), player(opponent)], config)
+    diagnosis = new_diagnosis()
+
+    def record(hand):
+        diagnose_hand(hand, seed, diagnosis)
+
+    players = [player(pkl), player(opponent)]
+    return play_match(players, config, record), diagnosis
 
 
 def build_pickle(spec: str, folder: str, trials: int | None) -> str:
@@ -190,6 +282,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--trials", type=int, help="sim trials, to run faster")
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() - 1))
+    parser.add_argument("--diagnose", action="store_true",
+                        help="show net by seat and folds of the best hand")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as folder:
@@ -208,7 +302,8 @@ def main():
                   f"{'faults':>7}{'slowest':>9}")
             means, squares = [], 0.0
             for name in args.opponents:
-                result = score([f.result() for f in futures[name]])
+                played = [f.result() for f in futures[name]]
+                result = score([log for log, _ in played])
                 bb, ci = result.bb_per_100[0], result.ci95[0]
                 verdict = ("ahead" if bb - ci > 0
                            else "behind" if bb + ci < 0 else "unclear")
@@ -217,6 +312,11 @@ def main():
                       f"{result.max_move_seconds[0]:>8.2f}s", flush=True)
                 if result.first_faults[0] is not None:
                     print(f"    first fault: {result.first_faults[0]}")
+                if args.diagnose:
+                    total = new_diagnosis()
+                    for _, part in played:
+                        merge(total, part)
+                    print_diagnosis(total)
                 means.append(bb)
                 squares += ci * ci
             count = len(means)
