@@ -532,6 +532,23 @@ def test_several_opponents_are_never_bluffed():
                for _ in range(300))
 
 
+def _value_bet(fold_rate, equity):
+    model = bot_with("KD 9C", 1)
+    stats = model._stats_of("seat 0")
+    stats["post_chances"] = 1000
+    stats["post_folds"] = int(fold_rate * 1000)
+    return model._checked_to(GameStateView(table(*AIR_FLOP)), equity)
+
+
+def test_a_station_gets_thinner_and_bigger_value_bets():
+    assert _value_bet(0.5, 0.50).kind == "call"
+    assert _value_bet(0.1, 0.50) == A.raise_to(1, 30)  # 0.75 of the pot
+    assert _value_bet(0.5, 0.60) == A.raise_to(1, 20)
+    assert _value_bet(0.1, 0.60) == A.raise_to(1, 30)
+    assert _value_bet(0.5, 0.80) == A.raise_to(1, 30)
+    assert _value_bet(0.1, 0.80) == A.raise_to(1, 40)
+
+
 def test_draws_are_recognised():
     def draw(hand, board):
         return bot_with(hand, 0)._has_draw(cards(board))

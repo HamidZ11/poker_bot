@@ -75,6 +75,11 @@ AIR_BLUFF = 0.02
 AIR_MAX_EQUITY = 0.40  # above this a hand can win without betting
 MIN_FOLD_CHANCES = 8  # bets of ours they have answered before we bluff at all
 
+# Against someone who rarely folds, value bets go thinner and bigger.
+STATION_FOLD_RATE = 0.30
+STATION_VALUE_DROP = 0.06  # off the equity needed to bet
+STATION_EXTRA_SIZE = 0.25  # of the pot
+
 
 def hand_key(first: Card, second: Card) -> str:
     """A starting hand's name in preflop_table: "AA", "AKs" or "AKo"."""
@@ -554,12 +559,23 @@ class Model:
         return self._check_or_fold(gs)
 
     def _checked_to(self, gs: GameStateView, equity: float) -> PlayerAction:
-        if equity < self.VALUE_BET:
+        station = self._against_a_station(gs)
+        needed = self.VALUE_BET - (STATION_VALUE_DROP if station else 0.0)
+        if equity < needed:
             return self._bluff(gs, equity) or PlayerAction.call(self.player_id)
         if gs.spr(self.player_id) <= 1:
             return self._shove(gs)
-        return self._pot_raise(
-            gs, 0.75 if equity >= self.VALUE_RAISE else 0.5
+        size = 0.75 if equity >= self.VALUE_RAISE else 0.5
+        return self._pot_raise(gs, size + (STATION_EXTRA_SIZE if station else 0))
+
+    def _against_a_station(self, gs: GameStateView) -> bool:
+        others = [p for p in gs.players_in_hand if p != self.player_id]
+        if len(others) != 1:
+            return False
+        team = gs.teams[others[0]]
+        return (
+            self._stats_of(team)["post_chances"] >= MIN_FOLD_CHANCES
+            and self._fold_rate(team) < STATION_FOLD_RATE
         )
 
     def _bluff(self, gs: GameStateView, equity: float) -> PlayerAction | None:
